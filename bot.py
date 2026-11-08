@@ -1,7 +1,7 @@
 import os
 import asyncio
-import imaplib
-import email
+import re
+import hmac
 import random
 import string
 from io import BytesIO
@@ -11,15 +11,17 @@ from PIL import Image
 from datetime import datetime, timedelta
 from pyrogram import Client, filters, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from flask import Flask
+from flask import Flask, request
 from threading import Thread
-from db import get_settings, update_setting
+from db import get_settings, update_setting, save_payment, claim_payment
 
 # ================= CONFIGURATION =================
 API_ID = int(os.environ.get("API_ID", 1234567))
 API_HASH = os.environ.get("API_HASH", "your_api_hash")
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "your_bot_token")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", 123456789))
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+MAX_UTR_ATTEMPTS = 5
 # =================================================
 
 # 1. Flask App (Render Port 8080 Binding)
@@ -28,6 +30,41 @@ app = Flask(__name__)
 @app.route('/')
 def home():
     return "KCXRY Payment Bot is live and running on Render!"
+
+
+# MacroDroid -> POST/GET /payment?key=SECRET  (text=<notification text>  OR  utr=..&amount=..)
+@app.route('/payment', methods=['GET', 'POST'])
+def payment_webhook():
+    data = {}
+    data.update(request.args.to_dict())
+    data.update(request.form.to_dict())
+    if request.is_json:
+        data.update(request.get_json(silent=True) or {})
+
+    key = str(data.get("key", ""))
+    if not WEBHOOK_SECRET or not hmac.compare_digest(key, WEBHOOK_SECRET):
+        return "forbidden", 403
+
+    text = str(data.get("text", ""))
+    utr = str(data.get("utr", "")).strip()
+    amount = str(data.get("amount", "")).strip()
+
+    if not utr:
+        m = re.search(r"\b(\d{12})\b", text)
+        utr = m.group(1) if m else ""
+    if not amount:
+        m = re.search(r"(?:₹|rs\.?|inr)\s*([\d,]+(?:\.\d{1,2})?)", text, re.I)
+        amount = m.group(1).replace(",", "") if m else ""
+
+    utr = re.sub(r"[^A-Za-z0-9]", "", utr).upper()
+    try:
+        amount_val = float(amount)
+    except ValueError:
+        return "bad amount", 400
+    if len(utr) < 8 or amount_val <= 0:
+        return "bad utr/amount", 400
+
+    return ("saved", 200) if save_payment(utr, amount_val, text) else ("duplicate", 200)
 
 def run_flask():
     port = int(os.environ.get("PORT", 8080))
@@ -42,7 +79,6 @@ bot = Client(
 )
 
 user_data = {}
-setup_states = {}
 
 def generate_order_id():
     letters = string.ascii_uppercase + string.digits
@@ -82,12 +118,7 @@ async def start_command(client, message):
         "⚡ *ʙʏ: ᴋᴄxʀʏ*"
     )
 
-# ================= STEP-BY-STEP SETUP WIZARD =================
-@bot.on_message(filters.command("setup") & filters.user(ADMIN_ID))
-async def start_setup_wizard(client, message):
-    setup_states[message.from_user.id] = {"step": "waiting_for_gmail"}
-    await message.reply("📧 **ᴘʟᴇᴀsᴇ sᴇɴᴅ ʏᴏᴜʀ ɢᴍᴀɪʟ ɪᴅ:**\n*(ᴛʜɪs ᴍᴇssᴀɢᴇ ᴡɪʟʟ ʙᴇ ᴅᴇʟᴇᴛᴇᴅ ғᴏʀ sᴇᴄᴜʀɪᴛʏ)*")
-
+# ================= ADMIN COMMANDS =================
 @bot.on_message(filters.command("setupi") & filters.user(ADMIN_ID))
 async def set_upi_command(client, message):
     try:
@@ -108,82 +139,50 @@ async def view_settings_command(client, message):
     s = get_settings()
     await message.reply(
         f"⚙️ **ᴄᴜʀʀᴇɴᴛ ʙᴏᴛ sᴇᴛᴛɪɴɢs (ғʀᴏᴍ ᴅʙ):**\n\n"
-        f"📧 **ɢᴍᴀɪʟ:** `{s['gmail_user']}`\n"
-        f"🔑 **ᴀᴘᴘ ᴘᴀssᴡᴏʀᴅ:** `********`\n"
         f"💼 **ᴜᴘɪ ɪᴅ:** `{s['upi_id']}`\n"
         f"👤 **ɴᴀᴍᴇ:** `{s['upi_name']}`\n\n"
         f"⚡ *ʙʏ: ᴋᴄxʀʏ*"
     )
 # ==============================================================
 
-@bot.on_message(filters.text & ~filters.command(["start", "setup", "setupi", "settings"]))
+@bot.on_message(filters.text & ~filters.command(["start", "setupi", "settings"]))
 async def handle_text_inputs(client, message):
     user_id = message.from_user.id
     text = message.text.strip()
-    
-    # 1. Setup Wizard Steps
-    if user_id in setup_states:
-        state = setup_states[user_id].get("step")
-        
-        if state == "waiting_for_gmail":
-            setup_states[user_id]["temp_gmail"] = text
-            setup_states[user_id]["step"] = "waiting_for_password"
-            try:
-                await message.delete()
-            except:
-                pass
-            await message.reply("🔑 **ɢʀᴇᴀᴛ! ɴᴏᴡ sᴇɴᴅ ʏᴏᴜʀ ɢᴍᴀɪʟ ᴀᴘᴘ ᴘᴀssᴡᴏʀᴅ:**\n*(ᴛʜɪs ᴍᴇssᴀɢᴇ ᴡɪʟʟ ᴀʟsᴏ ʙᴇ ᴅᴇʟᴇᴛᴇᴅ)*")
-            return
-            
-        elif state == "waiting_for_password":
-            gmail_user = setup_states[user_id].get("temp_gmail")
-            gmail_pass = text
-            
-            update_setting("gmail_user", gmail_user)
-            update_setting("gmail_pass", gmail_pass)
-            
-            setup_states.pop(user_id, None)
-            try:
-                await message.delete()
-            except:
-                pass
-                
-            await message.reply(
-                "✅ **ɢᴍᴀɪʟ sᴇᴛᴜᴘ ᴄᴏᴍᴘʟᴇᴛᴇᴅ sᴜᴄᴄᴇssғᴜʟʟʏ!** 🎉\n"
-                f"📧 ᴇᴍᴀɪʟ: `{gmail_user}`\n"
-                f"🔑 ᴀᴘᴘ ᴘᴀssᴡᴏʀᴅ sᴀᴠᴇᴅ sᴇᴄᴜʀᴇʟʏ.\n\n"
-                f"⚡ *ʙʏ: ᴋᴄxʀʏ*"
-            )
-            return
 
-    # 2. General User / Payment Flow
     if user_id not in user_data:
         user_data[user_id] = {"step": "idle"}
-    
+
     current_step = user_data[user_id].get("step")
 
     if current_step == "awaiting_amount":
         if not text.isdigit() or int(text) <= 0:
             await message.reply("❌ **ᴘʟᴇᴀsᴇ ᴇɴᴛᴇʀ ᴀ ᴠᴀʟɪᴅ ᴀᴍᴏᴜɴᴛ** (ᴇ.ɢ., `100`).")
             return
-        
+
         amount = int(text)
+
+        # "invoice generating" message - deleted once the QR/details are ready
+        wait_msg = await message.reply("⏳ **ʏᴏᴜʀ ɪɴᴠᴏɪᴄᴇ ɪs ɢᴇɴᴇʀᴀᴛɪɴɢ, ᴘʟᴇᴀsᴇ ᴡᴀɪᴛ...**")
+
         order_id = f"ORD-{generate_order_id()}"
         expires_at = datetime.now() + timedelta(minutes=10)
-        
+
         settings = get_settings()
-        
+
         user_data[user_id]["amount"] = amount
         user_data[user_id]["order_id"] = order_id
         user_data[user_id]["expires_at"] = expires_at
+        user_data[user_id]["created_utc"] = datetime.utcnow()
+        user_data[user_id]["attempts"] = 0
         user_data[user_id]["step"] = "awaiting_utr"
-        
+
         upi_url = (
             f"upi://pay?pa={quote(settings['upi_id'], safe='@')}"
             f"&pn={quote(settings['upi_name'])}"
             f"&am={amount}&cu=INR&tn={quote('Order_' + order_id)}"
         )
-        
+
         details_text = (
             f"🧾 **ᴏʀᴅᴇʀ ᴅᴇᴛᴀɪʟs & ɪɴᴠᴏɪᴄᴇ**\n"
             f"━━━━━━━━━━━━━━━━━━━\n"
@@ -198,16 +197,15 @@ async def handle_text_inputs(client, message):
             f"⚠️ ᴘᴀʏ ᴛʜᴇ ᴀʙᴏᴠᴇ ᴀᴍᴏᴜɴᴛ ᴀɴᴅ ᴄʟɪᴄᴋ **'I Have Paid'** ᴛᴏ ᴘʀᴏᴠɪᴅᴇ ʏᴏᴜʀ ᴜᴛʀ.\n\n"
             f"⚡ *ʙʏ: ᴋᴄxʀʏ*"
         )
-        
+
         keyboard = InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ ɪ ʜᴀᴠᴇ ᴘᴀɪᴅ (ᴠᴇʀɪғʏ ᴜᴛʀ)", callback_data="ask_utr")],
             [InlineKeyboardButton("❌ ᴄᴀɴᴄᴇʟ ᴏʀᴅᴇʀ", callback_data="cancel_order")]
         ])
-        
+
         try:
             qr_img = make_qr_image(upi_url, 250)
             if len(details_text) <= 1024:
-                # QR on top, order details as caption below it
                 await message.reply_photo(qr_img, caption=details_text, reply_markup=keyboard)
             else:
                 await message.reply_photo(qr_img)
@@ -215,29 +213,40 @@ async def handle_text_inputs(client, message):
         except Exception as e:
             print(f"QR Error: {e}")
             await message.reply(details_text, disable_web_page_preview=True, reply_markup=keyboard)
+
+        try:
+            await wait_msg.delete()
+        except Exception:
+            pass
         return
 
     elif current_step == "awaiting_utr":
         order_info = user_data[user_id]
-        
+
         if datetime.now() > order_info["expires_at"]:
             await message.reply("⏳ **ᴛʜɪs ᴏʀᴅᴇʀ ʜᴀs ᴇxᴘɪʀᴇᴅ!** ᴘʟᴇᴀsᴇ ᴛʏᴘᴇ `/start` ᴛᴏ ᴄʀᴇᴀᴛᴇ ᴀ ɴᴇᴡ ᴏʀᴅᴇʀ.")
             user_data[user_id]["step"] = "idle"
             return
-            
-        utr = text
+
+        utr = re.sub(r"[^A-Za-z0-9]", "", text).upper()
         if len(utr) < 8:
             await message.reply("❌ **ɪɴᴠᴀʟɪᴅ ᴜᴛʀ!** ᴘʟᴇᴀsᴇ sᴇɴᴅ ᴀ ᴠᴀʟɪᴅ 12-ᴅɪɢɪᴛ ᴜᴛʀ/ʀᴇғᴇʀᴇɴᴄᴇ ɴᴜᴍʙᴇʀ.")
             return
-            
-        processing_msg = await message.reply("⏳ **ᴠᴇʀɪғʏɪɴɢ ʏᴏᴜʀ ᴘᴀʏᴍᴇɴᴛ ᴠɪᴀ ɢᴍᴀɪʟ...**")
-        
+
+        processing_msg = await message.reply("⏳ **ᴠᴇʀɪғʏɪɴɢ ʏᴏᴜʀ ᴘᴀʏᴍᴇɴᴛ...**")
+
         loop = asyncio.get_running_loop()
-        is_verified = await loop.run_in_executor(None, verify_utr_in_gmail, utr, order_info["amount"])
-        
-        await processing_msg.delete()
-        
-        if is_verified:
+        result = await loop.run_in_executor(
+            None, claim_payment, utr, order_info["amount"], user_id,
+            order_info["order_id"], order_info["created_utc"]
+        )
+
+        try:
+            await processing_msg.delete()
+        except Exception:
+            pass
+
+        if result == "ok":
             await message.reply(
                 f"🎉 **ᴘᴀʏᴍᴇɴᴛ ᴠᴇʀɪғɪᴇᴅ sᴜᴄᴄᴇssғᴜʟʟʏ!**\n"
                 f"🆔 **ᴏʀᴅᴇʀ ɪᴅ:** `{order_info['order_id']}`\n"
@@ -246,14 +255,29 @@ async def handle_text_inputs(client, message):
                 f"⚡ *ʙʏ: ᴋᴄxʀʏ*"
             )
             user_data[user_id]["step"] = "idle"
+            return
+
+        # ---- failed attempt: tell the exact reason
+        user_data[user_id]["attempts"] = order_info.get("attempts", 0) + 1
+
+        if result == "used":
+            reason = "🚫 **ᴛʜɪs ᴜᴛʀ ɪs ᴀʟʀᴇᴀᴅʏ ᴜsᴇᴅ!**\nᴇᴀᴄʜ ᴜᴛʀ ᴄᴀɴ ʙᴇ ᴜsᴇᴅ ᴏɴʟʏ ᴏɴᴄᴇ."
+        elif result == "old":
+            reason = ("⏳ **ᴛʜɪs ᴜᴛʀ ɪs ᴇxᴘɪʀᴇᴅ / ᴏʟᴅ!**\n"
+                      "ᴛʜɪs ᴘᴀʏᴍᴇɴᴛ ᴡᴀs ᴍᴀᴅᴇ ʙᴇғᴏʀᴇ ᴛʜɪs ᴏʀᴅᴇʀ ᴡᴀs ᴄʀᴇᴀᴛᴇᴅ.")
+        elif result == "amount_mismatch":
+            reason = ("❌ **ᴀᴍᴏᴜɴᴛ ᴍɪsᴍᴀᴛᴄʜ!**\n"
+                      "ᴛʜɪs ᴜᴛʀ's ᴀᴍᴏᴜɴᴛ ᴅᴏᴇs ɴᴏᴛ ᴍᴀᴛᴄʜ ʏᴏᴜʀ ᴏʀᴅᴇʀ.")
+        else:  # not_found
+            reason = ("❌ **ᴘᴀʏᴍᴇɴᴛ ɴᴏᴛ ғᴏᴜɴᴅ ʏᴇᴛ!**\n"
+                      "ᴡᴀɪᴛ 1-2 ᴍɪɴᴜᴛᴇs ᴀɴᴅ sᴇɴᴅ ᴛʜᴇ ᴜᴛʀ ᴀɢᴀɪɴ, ᴏʀ ᴄʜᴇᴄᴋ ᴛʜᴇ ᴜᴛʀ ɴᴜᴍʙᴇʀ.")
+
+        left = MAX_UTR_ATTEMPTS - user_data[user_id]["attempts"]
+        if left <= 0:
+            user_data[user_id]["step"] = "idle"
+            await message.reply(reason + "\n\n🔒 **ᴛᴏᴏ ᴍᴀɴʏ ᴡʀᴏɴɢ ᴀᴛᴛᴇᴍᴘᴛs.** ᴏʀᴅᴇʀ ʟᴏᴄᴋᴇᴅ, ᴛʏᴘᴇ `/start` ᴀɢᴀɪɴ.")
         else:
-            await message.reply(
-                "❌ **ᴘᴀʏᴍᴇɴᴛ ɴᴏᴛ ғᴏᴜɴᴅ / ᴍᴀᴛᴄʜᴇᴅ!**\n"
-                "ᴘᴏssɪʙʟᴇ ʀᴇᴀsᴏɴs:\n"
-                "1. ɪɴᴄᴏʀʀᴇᴄᴛ ᴜᴛʀ ɴᴜᴍʙᴇʀ.\n"
-                "2. ʙᴀɴᴋ/ɢᴀᴛᴇᴡᴀʏ ᴇᴍᴀɪʟ ɴᴏᴛ ʀᴇᴄᴇɪᴠᴇᴅ ʏᴇᴛ.\n\n"
-                "ᴘʟᴇᴀsᴇ ᴠᴇʀɪғʏ ᴀɴᴅ sᴇɴᴅ ᴛʜᴇ ᴄᴏʀʀᴇᴄᴛ ᴜᴛʀ ᴀɢᴀɪɴ."
-            )
+            await message.reply(reason + f"\n\nᴀᴛᴛᴇᴍᴘᴛs ʟᴇғᴛ: {left}")
 
 @bot.on_callback_query(filters.regex("^ask_utr"))
 async def ask_for_utr(client, callback_query):
@@ -277,52 +301,6 @@ async def cancel_order(client, callback_query):
     await callback_query.message.edit_text("❌ **ᴏʀᴅᴇʀ ᴄᴀɴᴄᴇʟʟᴇᴅ.** ᴛʏᴘᴇ `/start` ᴛᴏ sᴛᴀʀᴛ ᴀɢᴀɪɴ.")
     await callback_query.answer()
 
-# Gmail IMAP Verification Function
-def verify_utr_in_gmail(utr_number, expected_amount):
-    try:
-        settings = get_settings()
-        mail = imaplib.IMAP4_SSL("imap.gmail.com")
-        mail.login(settings["gmail_user"], settings["gmail_pass"])
-        mail.select("inbox")
-        
-        date_since = (datetime.now() - timedelta(days=1)).strftime("%d-%b-%Y")
-        status, messages = mail.search(None, f'(SINCE "{date_since}")')
-        
-        if status != "OK":
-            mail.logout()
-            return False
-
-        for num in messages[0].split():
-            status, data = mail.fetch(num, "(RFC822)")
-            if status != "OK":
-                continue
-            
-            msg = email.message_from_bytes(data[0][1])
-            body = ""
-            
-            if msg.is_multipart():
-                for part in msg.walk():
-                    if part.get_content_type() == "text/plain":
-                        try:
-                            body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
-                        except:
-                            pass
-            else:
-                try:
-                    body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
-                except:
-                    pass
-            
-            if utr_number in body and str(expected_amount) in body:
-                mail.logout()
-                return True
-
-        mail.logout()
-        return False
-    except Exception as e:
-        print(f"IMAP Error: {e}")
-        return False
-
 async def main():
     await bot.start()
     try:
@@ -334,6 +312,8 @@ async def main():
         )
     except Exception as e:
         print(f"Startup Notification Error: {e}")
+    if not WEBHOOK_SECRET:
+        print("⚠️ WEBHOOK_SECRET not set - /payment webhook is disabled (all requests rejected)")
     print("🤖 KCXRY Payment Bot & Port 8080 Server Started Successfully!")
     await idle()
     await bot.stop()
