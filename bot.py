@@ -4,6 +4,10 @@ import imaplib
 import email
 import random
 import string
+from io import BytesIO
+from urllib.parse import quote
+import qrcode
+from PIL import Image
 from datetime import datetime, timedelta
 from pyrogram import Client, filters, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -43,6 +47,24 @@ setup_states = {}
 def generate_order_id():
     letters = string.ascii_uppercase + string.digits
     return ''.join(random.choice(letters) for i in range(8))
+
+def make_qr_image(data, size=250):
+    """Black & white QR, exactly size x size pixels, returned as in-memory PNG."""
+    qr = qrcode.QRCode(
+        version=None,
+        error_correction=qrcode.constants.ERROR_CORRECT_M,
+        box_size=10,
+        border=2,
+    )
+    qr.add_data(data)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white").convert("RGB")
+    img = img.resize((size, size), Image.LANCZOS)
+    bio = BytesIO()
+    bio.name = "payment_qr.png"
+    img.save(bio, "PNG")
+    bio.seek(0)
+    return bio
 
 @bot.on_message(filters.command("start"))
 async def start_command(client, message):
@@ -156,7 +178,11 @@ async def handle_text_inputs(client, message):
         user_data[user_id]["expires_at"] = expires_at
         user_data[user_id]["step"] = "awaiting_utr"
         
-        upi_url = f"upi://pay?pa={settings['upi_id']}&pn={settings['upi_name']}&am={amount}&cu=INR&tn=Order_{order_id}"
+        upi_url = (
+            f"upi://pay?pa={quote(settings['upi_id'], safe='@')}"
+            f"&pn={quote(settings['upi_name'])}"
+            f"&am={amount}&cu=INR&tn={quote('Order_' + order_id)}"
+        )
         
         details_text = (
             f"🧾 **ᴏʀᴅᴇʀ ᴅᴇᴛᴀɪʟs & ɪɴᴠᴏɪᴄᴇ**\n"
@@ -178,7 +204,17 @@ async def handle_text_inputs(client, message):
             [InlineKeyboardButton("❌ ᴄᴀɴᴄᴇʟ ᴏʀᴅᴇʀ", callback_data="cancel_order")]
         ])
         
-        await message.reply(details_text, disable_web_page_preview=True, reply_markup=keyboard)
+        try:
+            qr_img = make_qr_image(upi_url, 250)
+            if len(details_text) <= 1024:
+                # QR on top, order details as caption below it
+                await message.reply_photo(qr_img, caption=details_text, reply_markup=keyboard)
+            else:
+                await message.reply_photo(qr_img)
+                await message.reply(details_text, disable_web_page_preview=True, reply_markup=keyboard)
+        except Exception as e:
+            print(f"QR Error: {e}")
+            await message.reply(details_text, disable_web_page_preview=True, reply_markup=keyboard)
         return
 
     elif current_step == "awaiting_utr":
