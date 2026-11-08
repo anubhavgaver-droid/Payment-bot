@@ -13,7 +13,10 @@ from pyrogram import Client, filters, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from flask import Flask, request
 from threading import Thread
-from db import get_settings, update_setting, save_payment, claim_payment
+from db import (get_settings, update_setting, save_payment, claim_payment,
+                set_client, get_client, del_client, list_clients,
+                save_order, mark_delivered, bump_attempt, pending_orders)
+from integration import parse_payload, verify_payload, post_callback
 
 # ================= CONFIGURATION =================
 API_ID = int(os.environ.get("API_ID", 1234567))
@@ -106,7 +109,19 @@ def make_qr_image(data, size=250):
 async def start_command(client, message):
     user_id = message.from_user.id
     user_data[user_id] = {"step": "awaiting_amount"}
-    
+
+    # Redirect from another bot: /start pay-<key>-<amount>-<ref>-<sig>
+    if len(message.command) > 1:
+        parsed = parse_payload(message.command[1])
+        client_cfg = get_client(parsed[0]) if parsed else None
+        if not parsed or not client_cfg or not verify_payload(
+                client_cfg["secret"], user_id, parsed[1], parsed[2], parsed[3]):
+            await message.reply("❌ **ɪɴᴠᴀʟɪᴅ ᴏʀ ᴇxᴘɪʀᴇᴅ ᴘᴀʏᴍᴇɴᴛ ʟɪɴᴋ!**\nᴘʟᴇᴀsᴇ ɢᴏ ʙᴀᴄᴋ ᴛᴏ ᴛʜᴇ ʙᴏᴛ ᴀɴᴅ ᴛᴀᴘ ᴛʜᴇ ᴘᴀʏ ʙᴜᴛᴛᴏɴ ᴀɢᴀɪɴ.")
+            user_data[user_id] = {"step": "idle"}
+            return
+        await create_order(message, user_id, parsed[1], parsed[0], parsed[2])
+        return
+
     settings = get_settings()
     
     await message.reply(
@@ -145,7 +160,68 @@ async def view_settings_command(client, message):
     )
 # ==============================================================
 
-@bot.on_message(filters.text & ~filters.command(["start", "setupi", "settings"]))
+async def create_order(message, user_id, amount, client_key=None, ref=None):
+    # "invoice generating" message - deleted once the QR/details are ready
+    wait_msg = await message.reply("⏳ **ʏᴏᴜʀ ɪɴᴠᴏɪᴄᴇ ɪs ɢᴇɴᴇʀᴀᴛɪɴɢ, ᴘʟᴇᴀsᴇ ᴡᴀɪᴛ...**")
+
+    order_id = f"ORD-{generate_order_id()}"
+    expires_at = datetime.now() + timedelta(minutes=10)
+
+    settings = get_settings()
+
+    user_data.setdefault(user_id, {})
+    user_data[user_id]["amount"] = amount
+    user_data[user_id]["order_id"] = order_id
+    user_data[user_id]["expires_at"] = expires_at
+    user_data[user_id]["created_utc"] = datetime.utcnow()
+    user_data[user_id]["attempts"] = 0
+    user_data[user_id]["client"] = client_key
+    user_data[user_id]["ref"] = ref
+    user_data[user_id]["step"] = "awaiting_utr"
+
+    upi_url = (
+        f"upi://pay?pa={quote(settings['upi_id'], safe='@')}"
+        f"&pn={quote(settings['upi_name'])}"
+        f"&am={amount}&cu=INR&tn={quote('Order_' + order_id)}"
+    )
+
+    details_text = (
+        f"🧾 **ᴏʀᴅᴇʀ ᴅᴇᴛᴀɪʟs & ɪɴᴠᴏɪᴄᴇ**\n"
+        f"━━━━━━━━━━━━━━━━━━━\n"
+        f"🆔 **ᴏʀᴅᴇʀ ɪᴅ:** `{order_id}`\n"
+        f"💵 **ᴀᴍᴏᴜɴᴛ:** ₹{amount}\n"
+        f"⏱ **ᴇxᴘɪʀᴇs ɪɴ:** 10 ᴍɪɴᴜᴛᴇs (ᴀᴛ {expires_at.strftime('%H:%M:%S')})\n"
+        f"━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📌 **ɢᴀᴛᴇᴡᴀʏ:** {settings['gateway_name']}\n"
+        f"💼 **ᴜᴘɪ ɪᴅ:** `{settings['upi_id']}`\n"
+        f"👤 **ɴᴀᴍᴇ:** `{settings['upi_name']}`\n\n"
+        f"🔗 **ᴅɪʀᴇᴄᴛ ᴜᴘɪ ʟɪɴᴋ:** [ᴄʟɪᴄᴋ ᴛᴏ ᴘᴀʏ]({upi_url})\n\n"
+        f"⚠️ ᴘᴀʏ ᴛʜᴇ ᴀʙᴏᴠᴇ ᴀᴍᴏᴜɴᴛ ᴀɴᴅ ᴄʟɪᴄᴋ **'I Have Paid'** ᴛᴏ ᴘʀᴏᴠɪᴅᴇ ʏᴏᴜʀ ᴜᴛʀ.\n\n"
+        f"⚡ *ʙʏ: ᴋᴄxʀʏ*"
+    )
+
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ ɪ ʜᴀᴠᴇ ᴘᴀɪᴅ (ᴠᴇʀɪғʏ ᴜᴛʀ)", callback_data="ask_utr")],
+        [InlineKeyboardButton("❌ ᴄᴀɴᴄᴇʟ ᴏʀᴅᴇʀ", callback_data="cancel_order")]
+    ])
+
+    try:
+        qr_img = make_qr_image(upi_url, 250)
+        if len(details_text) <= 1024:
+            await message.reply_photo(qr_img, caption=details_text, reply_markup=keyboard)
+        else:
+            await message.reply_photo(qr_img)
+            await message.reply(details_text, disable_web_page_preview=True, reply_markup=keyboard)
+    except Exception as e:
+        print(f"QR Error: {e}")
+        await message.reply(details_text, disable_web_page_preview=True, reply_markup=keyboard)
+
+    try:
+        await wait_msg.delete()
+    except Exception:
+        pass
+
+@bot.on_message(filters.text & ~filters.command(["start", "setupi", "settings", "addbot", "delbot", "bots"]))
 async def handle_text_inputs(client, message):
     user_id = message.from_user.id
     text = message.text.strip()
@@ -160,64 +236,7 @@ async def handle_text_inputs(client, message):
             await message.reply("❌ **ᴘʟᴇᴀsᴇ ᴇɴᴛᴇʀ ᴀ ᴠᴀʟɪᴅ ᴀᴍᴏᴜɴᴛ** (ᴇ.ɢ., `100`).")
             return
 
-        amount = int(text)
-
-        # "invoice generating" message - deleted once the QR/details are ready
-        wait_msg = await message.reply("⏳ **ʏᴏᴜʀ ɪɴᴠᴏɪᴄᴇ ɪs ɢᴇɴᴇʀᴀᴛɪɴɢ, ᴘʟᴇᴀsᴇ ᴡᴀɪᴛ...**")
-
-        order_id = f"ORD-{generate_order_id()}"
-        expires_at = datetime.now() + timedelta(minutes=10)
-
-        settings = get_settings()
-
-        user_data[user_id]["amount"] = amount
-        user_data[user_id]["order_id"] = order_id
-        user_data[user_id]["expires_at"] = expires_at
-        user_data[user_id]["created_utc"] = datetime.utcnow()
-        user_data[user_id]["attempts"] = 0
-        user_data[user_id]["step"] = "awaiting_utr"
-
-        upi_url = (
-            f"upi://pay?pa={quote(settings['upi_id'], safe='@')}"
-            f"&pn={quote(settings['upi_name'])}"
-            f"&am={amount}&cu=INR&tn={quote('Order_' + order_id)}"
-        )
-
-        details_text = (
-            f"🧾 **ᴏʀᴅᴇʀ ᴅᴇᴛᴀɪʟs & ɪɴᴠᴏɪᴄᴇ**\n"
-            f"━━━━━━━━━━━━━━━━━━━\n"
-            f"🆔 **ᴏʀᴅᴇʀ ɪᴅ:** `{order_id}`\n"
-            f"💵 **ᴀᴍᴏᴜɴᴛ:** ₹{amount}\n"
-            f"⏱ **ᴇxᴘɪʀᴇs ɪɴ:** 10 ᴍɪɴᴜᴛᴇs (ᴀᴛ {expires_at.strftime('%H:%M:%S')})\n"
-            f"━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📌 **ɢᴀᴛᴇᴡᴀʏ:** {settings['gateway_name']}\n"
-            f"💼 **ᴜᴘɪ ɪᴅ:** `{settings['upi_id']}`\n"
-            f"👤 **ɴᴀᴍᴇ:** `{settings['upi_name']}`\n\n"
-            f"🔗 **ᴅɪʀᴇᴄᴛ ᴜᴘɪ ʟɪɴᴋ:** [ᴄʟɪᴄᴋ ᴛᴏ ᴘᴀʏ]({upi_url})\n\n"
-            f"⚠️ ᴘᴀʏ ᴛʜᴇ ᴀʙᴏᴠᴇ ᴀᴍᴏᴜɴᴛ ᴀɴᴅ ᴄʟɪᴄᴋ **'I Have Paid'** ᴛᴏ ᴘʀᴏᴠɪᴅᴇ ʏᴏᴜʀ ᴜᴛʀ.\n\n"
-            f"⚡ *ʙʏ: ᴋᴄxʀʏ*"
-        )
-
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ ɪ ʜᴀᴠᴇ ᴘᴀɪᴅ (ᴠᴇʀɪғʏ ᴜᴛʀ)", callback_data="ask_utr")],
-            [InlineKeyboardButton("❌ ᴄᴀɴᴄᴇʟ ᴏʀᴅᴇʀ", callback_data="cancel_order")]
-        ])
-
-        try:
-            qr_img = make_qr_image(upi_url, 250)
-            if len(details_text) <= 1024:
-                await message.reply_photo(qr_img, caption=details_text, reply_markup=keyboard)
-            else:
-                await message.reply_photo(qr_img)
-                await message.reply(details_text, disable_web_page_preview=True, reply_markup=keyboard)
-        except Exception as e:
-            print(f"QR Error: {e}")
-            await message.reply(details_text, disable_web_page_preview=True, reply_markup=keyboard)
-
-        try:
-            await wait_msg.delete()
-        except Exception:
-            pass
+        await create_order(message, user_id, int(text))
         return
 
     elif current_step == "awaiting_utr":
@@ -255,6 +274,25 @@ async def handle_text_inputs(client, message):
                 f"⚡ *ʙʏ: ᴋᴄxʀʏ*"
             )
             user_data[user_id]["step"] = "idle"
+
+            if order_info.get("client"):
+                order = {
+                    "_id": order_info["order_id"], "user_id": user_id,
+                    "amount": order_info["amount"], "client": order_info["client"],
+                    "ref": order_info["ref"], "paid_at": datetime.utcnow().isoformat(),
+                    "delivered": False, "attempts": 0,
+                }
+                save_order(order)
+                delivered = await deliver_order(order)
+                cfg = get_client(order["client"]) or {}
+                rows = []
+                if cfg.get("bot_username"):
+                    rows = [[InlineKeyboardButton("🔙 ʙᴀᴄᴋ ᴛᴏ ʙᴏᴛ", url=f"https://t.me/{cfg['bot_username']}")]]
+                if delivered:
+                    txt = "✅ **ᴍᴇᴍʙᴇʀsʜɪᴘ ᴀᴄᴛɪᴠᴀᴛᴇᴅ ᴀᴜᴛᴏᴍᴀᴛɪᴄᴀʟʟʏ!**"
+                else:
+                    txt = "⏳ **ᴘᴀʏᴍᴇɴᴛ ᴅᴏɴᴇ.** ᴀᴄᴛɪᴠᴀᴛɪᴏɴ ɪs ᴅᴇʟᴀʏᴇᴅ, ɪᴛ ᴡɪʟʟ ʜᴀᴘᴘᴇɴ ᴀᴜᴛᴏᴍᴀᴛɪᴄᴀʟʟʏ sʜᴏʀᴛʟʏ."
+                await message.reply(txt, reply_markup=InlineKeyboardMarkup(rows) if rows else None)
             return
 
         # ---- failed attempt: tell the exact reason
@@ -301,6 +339,71 @@ async def cancel_order(client, callback_query):
     await callback_query.message.edit_text("❌ **ᴏʀᴅᴇʀ ᴄᴀɴᴄᴇʟʟᴇᴅ.** ᴛʏᴘᴇ `/start` ᴛᴏ sᴛᴀʀᴛ ᴀɢᴀɪɴ.")
     await callback_query.answer()
 
+# ================= CALLBACK DELIVERY TO CLIENT BOTS =================
+async def deliver_order(order):
+    cfg = get_client(order["client"])
+    if not cfg:
+        return False
+    data = {
+        "order_id": order["_id"], "user_id": order["user_id"],
+        "amount": order["amount"], "ref": order["ref"], "paid_at": order["paid_at"],
+    }
+    loop = asyncio.get_running_loop()
+    ok = await loop.run_in_executor(None, post_callback, cfg["callback_url"], cfg["secret"], data)
+    if ok:
+        mark_delivered(order["_id"])
+    else:
+        n = bump_attempt(order["_id"])
+        if n == 10:
+            try:
+                await bot.send_message(ADMIN_ID, f"⚠️ Callback to `{order['client']}` failing for order `{order['_id']}` (user {order['user_id']}, ₹{order['amount']}). Check that bot's /payment_done endpoint.")
+            except Exception:
+                pass
+    return ok
+
+async def retry_loop():
+    while True:
+        await asyncio.sleep(60)
+        try:
+            loop = asyncio.get_running_loop()
+            orders = await loop.run_in_executor(None, pending_orders)
+            for o in orders:
+                await deliver_order(o)
+        except Exception as e:
+            print(f"Retry loop error: {e}")
+
+@bot.on_message(filters.command("addbot") & filters.user(ADMIN_ID))
+async def add_client_bot(client, message):
+    try:
+        args = message.text.split(" ", 1)[1]
+        key, url, secret, uname = [x.strip() for x in args.split("|")]
+        if not key.isalnum() or len(key) > 12:
+            raise ValueError
+        set_client(key, url, secret, uname.lstrip("@"))
+        await message.reply(f"✅ Client bot `{key}` saved.")
+        try:
+            await message.delete()  # message contains the secret
+        except Exception:
+            pass
+    except Exception:
+        await message.reply("❌ Usage:\n`/addbot key | callback_url | secret | bot_username`\n(key: letters/digits only, max 12)")
+
+@bot.on_message(filters.command("delbot") & filters.user(ADMIN_ID))
+async def del_client_bot(client, message):
+    try:
+        key = message.text.split(" ", 1)[1].strip()
+        await message.reply("✅ Removed." if del_client(key) else "❌ Not found.")
+    except Exception:
+        await message.reply("Usage: `/delbot key`")
+
+@bot.on_message(filters.command("bots") & filters.user(ADMIN_ID))
+async def list_client_bots(client, message):
+    rows = list_clients()
+    if not rows:
+        await message.reply("No client bots yet. Use /addbot")
+        return
+    await message.reply("\n".join(f"• `{r['_id']}` → {r['callback_url']} (@{r['bot_username']})" for r in rows), disable_web_page_preview=True)
+
 async def main():
     await bot.start()
     try:
@@ -315,6 +418,7 @@ async def main():
     if not WEBHOOK_SECRET:
         print("⚠️ WEBHOOK_SECRET not set - /payment webhook is disabled (all requests rejected)")
     print("🤖 KCXRY Payment Bot & Port 8080 Server Started Successfully!")
+    asyncio.create_task(retry_loop())
     await idle()
     await bot.stop()
 

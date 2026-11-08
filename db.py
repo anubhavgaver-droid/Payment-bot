@@ -72,3 +72,36 @@ def claim_payment(utr, amount, user_id, order_id, order_created_utc):
         }}
     )
     return "ok" if res else "used"
+
+# ================= CLIENT BOTS (file store bot, auto post bot, ...) =================
+clients_col = db["client_bots"]   # _id = client key
+orders_col = db["orders"]         # paid orders, used for callback delivery + audit
+
+def set_client(key, callback_url, secret, bot_username):
+    clients_col.update_one(
+        {"_id": key},
+        {"$set": {"callback_url": callback_url, "secret": secret, "bot_username": bot_username}},
+        upsert=True,
+    )
+
+def get_client(key):
+    return clients_col.find_one({"_id": key})
+
+def del_client(key):
+    return clients_col.delete_one({"_id": key}).deleted_count
+
+def list_clients():
+    return list(clients_col.find({}))
+
+def save_order(doc):
+    orders_col.update_one({"_id": doc["_id"]}, {"$setOnInsert": doc}, upsert=True)
+
+def mark_delivered(order_id):
+    orders_col.update_one({"_id": order_id}, {"$set": {"delivered": True, "delivered_at": datetime.utcnow()}})
+
+def bump_attempt(order_id):
+    r = orders_col.find_one_and_update({"_id": order_id}, {"$inc": {"attempts": 1}})
+    return (r or {}).get("attempts", 0) + 1
+
+def pending_orders(limit=20):
+    return list(orders_col.find({"client": {"$ne": None}, "delivered": False, "attempts": {"$lt": 30}}).limit(limit))
