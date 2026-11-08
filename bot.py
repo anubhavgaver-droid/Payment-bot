@@ -5,7 +5,7 @@ import email
 import random
 import string
 from datetime import datetime, timedelta
-from pyrogram import Client, filters
+from pyrogram import Client, filters, idle
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from flask import Flask
 from threading import Thread
@@ -43,22 +43,6 @@ setup_states = {}
 def generate_order_id():
     letters = string.ascii_uppercase + string.digits
     return ''.join(random.choice(letters) for i in range(8))
-
-# Bot Startup Notification Handler
-@bot.on_raw_update()
-async def on_startup_notification(client, update, users, chats):
-    global startup_notified
-    if 'startup_notified' not in globals():
-        globals()['startup_notified'] = True
-        try:
-            await client.send_message(
-                ADMIN_ID,
-                "🤖 **ʙᴏᴛ ʀᴇsᴛᴀʀᴛᴇᴅ sᴜᴄᴄᴇssғᴜʟʟʏ!**\n\n"
-                "⚡ sᴇʀᴠᴇʀ ɪs ᴏɴʟɪɴᴇ ᴀɴᴅ ᴛʜᴇ ʙᴏᴛ ɪs ʀᴇᴀᴅʏ.\n"
-                "👑 **ᴅᴇᴠᴇʟᴏᴘᴇᴅ ʙʏ:** ᴋᴄxʀʏ"
-            )
-        except Exception as e:
-            print(f"Startup Notification Error: {e}")
 
 @bot.on_message(filters.command("start"))
 async def start_command(client, message):
@@ -289,7 +273,7 @@ def verify_utr_in_gmail(utr_number, expected_amount):
                             pass
             else:
                 try:
-                    body = part.get_payload(decode=True).decode('utf-8', errors='ignore')
+                    body = msg.get_payload(decode=True).decode('utf-8', errors='ignore')
                 except:
                     pass
             
@@ -303,10 +287,24 @@ def verify_utr_in_gmail(utr_number, expected_amount):
         print(f"IMAP Error: {e}")
         return False
 
+async def main():
+    await bot.start()
+    try:
+        await bot.send_message(
+            ADMIN_ID,
+            "🤖 **ʙᴏᴛ ʀᴇsᴛᴀʀᴛᴇᴅ sᴜᴄᴄᴇssғᴜʟʟʏ!**\n\n"
+            "⚡ sᴇʀᴠᴇʀ ɪs ᴏɴʟɪɴᴇ ᴀɴᴅ ᴛʜᴇ ʙᴏᴛ ɪs ʀᴇᴀᴅʏ.\n"
+            "👑 **ᴅᴇᴠᴇʟᴏᴘᴇᴅ ʙʏ:** ᴋᴄxʀʏ"
+        )
+    except Exception as e:
+        print(f"Startup Notification Error: {e}")
+    print("🤖 KCXRY Payment Bot & Port 8080 Server Started Successfully!")
+    await idle()
+    await bot.stop()
+
 if __name__ == "__main__":
     flask_thread = Thread(target=run_flask)
     flask_thread.daemon = True
     flask_thread.start()
-    
-    print("🤖 KCXRY Payment Bot & Port 8080 Server Started Successfully!")
-    bot.run()
+
+    bot.run(main())
