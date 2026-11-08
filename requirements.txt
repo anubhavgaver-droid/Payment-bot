@@ -1,0 +1,6 @@
+pyrogram
+tgcrypto
+flask
+pymongo
+dnspython
+qrcode
